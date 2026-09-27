@@ -292,6 +292,10 @@ pub struct ExecutorError {
     /// Timeout quarantine, suppressing honest peers for up to 2h. The typed field
     /// is unforgeable through contract return text.
     host_timeout: Option<HostTimeoutClass>,
+    /// Set only for ValidateResult::Invalid, before its type is flattened into
+    /// a stdlib cause string. Shared merges may carry an Update error internally;
+    /// a PUT client still needs to distinguish this refusal from resource errors.
+    validation_refused: bool,
 }
 
 /// Provenance class for a host-originated execution timeout (#4864 round-9). See
@@ -344,11 +348,37 @@ impl ValidationOpKind {
 impl std::error::Error for ExecutorError {}
 
 impl ExecutorError {
+    /// The key of an explicit validate_state refusal, including shared merges.
+    pub(crate) fn validation_refusal_key(&self) -> Option<ContractKey> {
+        if !self.validation_refused {
+            return None;
+        }
+        let err = self.inner.as_ref().left()?;
+        if let RequestError::ContractError(
+            StdContractError::Put { key, .. } | StdContractError::Update { key, .. },
+        ) = err.as_ref()
+        {
+            Some(*key)
+        } else {
+            None
+        }
+    }
+
+    /// Only call at a ValidateResult::Invalid branch. Error text, execution
+    /// failures and unresolved related contracts cannot establish this provenance.
+    fn validation_refused(error: StdContractError) -> Self {
+        Self {
+            validation_refused: true,
+            ..Self::request(error)
+        }
+    }
+
     pub fn other(error: impl Into<anyhow::Error>) -> Self {
         Self {
             inner: Either::Right(error.into()),
             fatal: false,
             host_timeout: None,
+            validation_refused: false,
         }
     }
 
@@ -358,6 +388,7 @@ impl ExecutorError {
             inner: Either::Right(anyhow::anyhow!("internal error")),
             fatal: false,
             host_timeout: None,
+            validation_refused: false,
         }
     }
 
@@ -366,6 +397,25 @@ impl ExecutorError {
             inner: Either::Left(Box::new(error.into())),
             fatal: false,
             host_timeout: None,
+            validation_refused: false,
+        }
+    }
+
+    /// Deliver a local PUT result using the same classification as the network
+    /// PUT driver. Stdlib 0.12 has no cause kind: reserve ContractError::Put for
+    /// an explicit validation refusal and use OperationError for other failures.
+    /// Call at the PUT request boundary, never for other operations.
+    pub(crate) fn into_put_client_error(self) -> freenet_stdlib::client_api::ClientError {
+        use freenet_stdlib::client_api::ErrorKind;
+        match self.validation_refusal_key() {
+            Some(key) => ErrorKind::RequestError(RequestError::ContractError(
+                StdContractError::invalid_put(key),
+            ))
+            .into(),
+            None => ErrorKind::OperationError {
+                cause: self.to_string().into(),
+            }
+            .into(),
         }
     }
 
@@ -698,6 +748,7 @@ impl ExecutorError {
             inner: Either::Right(anyhow::Error::new(DeferRelatedFetch { missing })),
             fatal: false,
             host_timeout: None,
+            validation_refused: false,
         }
     }
 
@@ -712,12 +763,14 @@ impl ExecutorError {
                     inner: Either::Right(err),
                     fatal: self.fatal,
                     host_timeout: self.host_timeout,
+                    validation_refused: self.validation_refused,
                 }),
             },
             inner @ Either::Left(_) => Err(Self {
                 inner,
                 fatal: self.fatal,
                 host_timeout: self.host_timeout,
+                validation_refused: self.validation_refused,
             }),
         }
     }
@@ -784,6 +837,7 @@ impl From<RequestError> for ExecutorError {
             inner: Either::Left(Box::new(value)),
             fatal: false,
             host_timeout: None,
+            validation_refused: false,
         }
     }
 }
@@ -803,6 +857,7 @@ impl From<Box<RequestError>> for ExecutorError {
             inner: Either::Left(value),
             fatal: false,
             host_timeout: None,
+            validation_refused: false,
         }
     }
 }

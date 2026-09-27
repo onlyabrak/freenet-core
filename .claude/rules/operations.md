@@ -158,7 +158,7 @@ for every inbound wire message. Pattern per op:
    `pending_op_results` callback is registered, forward it via
    `try_forward_driver_reply` and return. For GET/PUT/SUBSCRIBE the
    gate is `Response | ResponseStreaming` only. PUT additionally
-   accepts `PutMsg::Error` so the originator-loopback failure path
+   accepts `PutMsg::Error` and `PutMsg::ValidationRejected` so the originator-loopback failure path
    (issue #4111) delivers the contract-side cause via the same bypass
    instead of timing out the retry loop on a closed reply channel.
    CONNECT forwards
@@ -443,6 +443,15 @@ generic OpError::UnexpectedOpState wildcard.
 DoS amplification: cap the cause length at the wire boundary.
 PUT uses PUT_TERMINAL_CAUSE_MAX_BYTES = 2048 + a UTF-8-safe
 truncator (see `bound_cause` in operations/put.rs).
+
+Explicit validate_state refusals (#5746) use PutMsg::ValidationRejected
+with a ContractKey, never a classification parsed from cause text. Relays
+must preserve it, including streaming and shutdown delivery. The variant
+is appended to preserve existing bincode tags and emitted only to peers
+at or above PUT_VALIDATION_REJECTED_MIN_VERSION (or own loopback). Older
+or unknown peers receive the original bounded Error string, so a route
+through them cannot promise typed validation delivery. The version floor
+must match the first release containing the new decoder.
 
 Testing: PUT's bypass + multi-hop bubble is covered by unit tests
 in `operations/put/op_ctx_task.rs::tests` (search for

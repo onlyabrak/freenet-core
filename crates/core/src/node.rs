@@ -1353,6 +1353,7 @@ where
                 put::PutMsg::Response { .. }
                     | put::PutMsg::ResponseStreaming { .. }
                     | put::PutMsg::Error { .. }
+                    | put::PutMsg::ValidationRejected { .. }
                     | put::PutMsg::ProbeResponse { .. }
             ) && try_forward_driver_reply(
                 pending_op_result.as_ref(),
@@ -6151,6 +6152,10 @@ pub async fn run_local_node(
         } = req;
         tracing::debug!(client_id = %id, ?token, "Received OpenRequest -> {request}");
 
+        let is_put = matches!(
+            request.as_ref(),
+            ClientRequest::ContractOp(freenet_stdlib::client_api::ContractRequest::Put { .. })
+        );
         let res = match *request {
             ClientRequest::ContractOp(op) => {
                 executor
@@ -6205,14 +6210,18 @@ pub async fn run_local_node(
                     Receiver::Gw => gw.send(id, Ok(res)).await?,
                 };
             }
-            Err(err) if err.is_request() => {
-                let err = ErrorKind::RequestError(err.unwrap_request());
+            Err(err) if is_put || err.is_request() => {
+                let err = if is_put {
+                    err.into_put_client_error()
+                } else {
+                    ErrorKind::RequestError(err.unwrap_request()).into()
+                };
                 match receiver {
                     Receiver::Ws => {
-                        ws_proxy.send(id, Err(err.into())).await?;
+                        ws_proxy.send(id, Err(err)).await?;
                     }
                     Receiver::Gw => {
-                        gw.send(id, Err(err.into())).await?;
+                        gw.send(id, Err(err)).await?;
                     }
                 };
             }
@@ -8835,6 +8844,7 @@ mod tests {
                 "put::PutMsg::Response { .. }",
                 "put::PutMsg::ResponseStreaming { .. }",
                 "put::PutMsg::Error { .. }",
+                "put::PutMsg::ValidationRejected { .. }",
             ] {
                 assert!(
                     gate.contains(expected),

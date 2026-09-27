@@ -894,7 +894,9 @@ where
                                 "Contract validation failed, dropping queued operations"
                             );
                         }
-                        return Err(ExecutorError::request(StdContractError::invalid_put(key)));
+                        return Err(ExecutorError::validation_refused(
+                            StdContractError::invalid_put(key),
+                        ));
                     }
                     ValidateResult::RequestRelated(_) => {
                         // fetch_related_for_validation resolves RequestRelated internally.
@@ -2809,12 +2811,12 @@ where
     /// Used by UPDATE code paths. For PUT paths, use `validation_error_put`.
     pub(super) fn validation_error(key: ContractKey, result: ValidateResult) -> ExecutorError {
         match result {
-            ValidateResult::Invalid => {
-                ExecutorError::request(freenet_stdlib::client_api::ContractError::Update {
+            ValidateResult::Invalid => ExecutorError::validation_refused(
+                freenet_stdlib::client_api::ContractError::Update {
                     key,
                     cause: "invalid outcome state".into(),
-                })
-            }
+                },
+            ),
             ValidateResult::RequestRelated(_) => {
                 tracing::error!(
                     contract = %key,
@@ -2840,7 +2842,7 @@ where
     /// Used by PUT code paths to preserve correct error semantics for callers.
     pub(super) fn validation_error_put(key: ContractKey, result: ValidateResult) -> ExecutorError {
         match result {
-            ValidateResult::Invalid => ExecutorError::request(StdContractError::Put {
+            ValidateResult::Invalid => ExecutorError::validation_refused(StdContractError::Put {
                 key,
                 cause: "invalid outcome state after merge".into(),
             }),

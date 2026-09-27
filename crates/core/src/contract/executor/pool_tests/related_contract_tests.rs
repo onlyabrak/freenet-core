@@ -1346,3 +1346,106 @@ mod capture_e2e {
         );
     }
 }
+
+/// #5746: exercise the real bridged executor rejection, not a parsed error string.
+#[tokio::test(flavor = "current_thread")]
+async fn put_validation_refusal_has_typed_provenance() {
+    for already_stored in [false, true] {
+        let mut executor = create_executor().await;
+        let contract = make_contract(b"put_validation_refusal");
+        let key = contract.key();
+        if already_stored {
+            executor
+                .upsert_contract_state(
+                    key,
+                    Either::Left(WrappedState::new(vec![0])),
+                    RelatedContracts::default(),
+                    Some(contract.clone()),
+                )
+                .await
+                .unwrap();
+        }
+        executor
+            .runtime
+            .validate_overrides
+            .insert(*key.id(), ValidateOverride::Invalid);
+        let err = executor
+            .upsert_contract_state(
+                key,
+                Either::Left(WrappedState::new(vec![1])),
+                RelatedContracts::default(),
+                Some(contract),
+            )
+            .await
+            .expect_err("validate_state must refuse the PUT");
+        // The handler checks this owned error for a deferred related fetch
+        // before returning it; that round trip must preserve provenance.
+        let err = err
+            .into_defer_related_fetch()
+            .expect_err("validation is terminal");
+        assert_eq!(err.validation_refusal_key(), Some(key));
+        use crate::operations::{
+            OpError,
+            put::{PutMsg, PutTerminalError},
+        };
+        use freenet_stdlib::client_api::ErrorKind;
+        let op_error = OpError::ExecutorError(err);
+        let tx = crate::message::Transaction::new::<PutMsg>();
+        let mut wire = PutTerminalError::from_op_error(&op_error).into_message(tx, true);
+        // Every hop must preserve the key and typed reason through serialization.
+        for _ in 0..3 {
+            wire = bincode::deserialize(&bincode::serialize(&wire).unwrap()).unwrap();
+            let PutMsg::ValidationRejected { key: received, .. } = wire else {
+                panic!("validation refusal lost its type across a hop: {wire:?}");
+            };
+            assert_eq!(received, key);
+            wire = PutTerminalError::validation_rejected(received).into_message(tx, true);
+        }
+        let network_err = PutTerminalError::from_op_error(&op_error).into_client_error();
+        let OpError::ExecutorError(err) = op_error else {
+            unreachable!()
+        };
+        let local_err = err.into_put_client_error();
+        for err in [local_err, network_err] {
+            assert!(matches!(err.kind(), ErrorKind::RequestError(
+        freenet_stdlib::client_api::RequestError::ContractError(
+            freenet_stdlib::client_api::ContractError::Put { key: k, .. }
+        )) if *k == key));
+        }
+    }
+}
+
+#[test]
+fn put_validation_refusal_is_not_inferred_from_error_text() {
+    use crate::contract::ExecutorError;
+    use crate::operations::{OpError, put::PutTerminalError};
+    use freenet_stdlib::client_api::{ContractError, ErrorKind};
+    let key = make_contract(b"put_validation_not_text").key();
+    for cause in [
+        "invalid put",
+        "not valid",
+        "disk budget exceeded",
+        "",
+        "execution error",
+    ] {
+        let err = ExecutorError::request(ContractError::Put {
+            key,
+            cause: cause.into(),
+        });
+        assert_eq!(err.validation_refusal_key(), None);
+        assert!(matches!(
+            err.into_put_client_error().kind(),
+            ErrorKind::OperationError { .. }
+        ));
+        let err = OpError::ExecutorError(ExecutorError::request(ContractError::Put {
+            key,
+            cause: cause.into(),
+        }));
+        assert!(matches!(
+            PutTerminalError::from_op_error(&err)
+                .into_client_error()
+                .kind(),
+            ErrorKind::OperationError { .. }
+        ));
+    }
+}

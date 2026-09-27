@@ -567,10 +567,15 @@ impl Executor<Runtime> {
             if let (Some(len), Some(op_manager)) = (charged_wasm, &self.op_manager) {
                 op_manager.ring.record_wasm_removed(len);
             }
-            return Err(ExecutorError::request(StdContractError::Put {
+            let error = StdContractError::Put {
                 key,
                 cause: "not valid".into(),
-            }));
+            };
+            return Err(if result == ValidateResult::Invalid {
+                ExecutorError::validation_refused(error)
+            } else {
+                ExecutorError::request(error)
+            });
         }
 
         tracing::debug!(

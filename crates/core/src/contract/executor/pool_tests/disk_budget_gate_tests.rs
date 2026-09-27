@@ -197,6 +197,23 @@ async fn v1_put_over_budget_rejects_and_reverses_wasm_charge() {
                 msg.contains("disk budget"),
                 "PUT rejection must cite the disk budget, got: {msg}"
             );
+            // #5746: a resource refusal must not acquire validation provenance.
+            use crate::operations::{OpError, put::PutTerminalError};
+            use freenet_stdlib::client_api::ErrorKind;
+            assert_eq!(err.validation_refusal_key(), None);
+            let err = OpError::ExecutorError(err);
+            let network_err = PutTerminalError::from_op_error(&err).into_client_error();
+            assert!(matches!(
+                network_err.kind(),
+                ErrorKind::OperationError { .. }
+            ));
+            let OpError::ExecutorError(err) = err else {
+                unreachable!()
+            };
+            assert!(matches!(
+                err.into_put_client_error().kind(),
+                ErrorKind::OperationError { .. }
+            ));
         }
         Ok(other) => panic!("over-budget PUT must be rejected, got Ok({other:?})"),
     }

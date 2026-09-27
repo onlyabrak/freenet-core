@@ -220,6 +220,7 @@ pub(super) fn is_link_use_request(msg: &NetMessage) -> bool {
                 | PutMsg::ResponseStreaming { .. }
                 | PutMsg::ForwardingAck { .. }
                 | PutMsg::Error { .. }
+                | PutMsg::ValidationRejected { .. }
                 | PutMsg::ProbeResponse { .. } => false,
             },
             NetMessageV1::Get(m) => match m {

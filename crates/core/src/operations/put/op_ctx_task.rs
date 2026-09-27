@@ -644,7 +644,6 @@ async fn drive_client_put_inner(
         // No retries — the failure is local-deterministic. Publish the
         // real cause once, mark the tx completed.
         RetryLoopOutcome::Done((Err(cause), _hop_count)) => {
-            let cause = cause.into_string();
             // #5671: a streaming relay that cannot take the stream now reports
             // it as `PutMsg::Error` instead of going silent. The loopback relay
             // latches `local_store_committed` only after its own store
@@ -684,10 +683,7 @@ async fn drive_client_put_inner(
                 .await);
             }
             op_manager.completed(client_tx);
-            Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
-                cause: cause.into(),
-            }
-            .into())))
+            Ok(DriverOutcome::Publish(Err(cause.into_client_error())))
         }
         RetryLoopOutcome::Exhausted(cause) => {
             // #5458: see `exhausted_attempt_is_local_success` for why a
@@ -1194,6 +1190,12 @@ fn classify_reply(msg: &NetMessage) -> ReplyClass {
         })) => ReplyClass::LocalCompletion {
             key: contract.key(),
         },
+        // #5746: preserve the refusal kind and key independently of cause text.
+        NetMessage::V1(NetMessageV1::Put(PutMsg::ValidationRejected { key, .. })) => {
+            ReplyClass::TerminalError {
+                cause: PutTerminalError::validation_rejected(*key),
+            }
+        }
         // Issue #4111: terminal failure delivered via send_local_loopback
         // from the originator-loopback error path. The wire cause is a
         // raw `String` (intentional, see `PutMsg::Error`); we wrap it in
@@ -1423,10 +1425,16 @@ fn deliver_outcome(op_manager: &OpManager, client_tx: Transaction, outcome: Driv
                 error = %err,
                 "put: infrastructure error; publishing synthesized client error"
             );
-            let synthesized: HostResult = Err(ErrorKind::OperationError {
-                cause: format!("PUT failed: {err}").into(),
-            }
-            .into());
+            let synthesized: HostResult = if matches!(&err,
+                OpError::ExecutorError(exec) if exec.validation_refusal_key().is_some())
+            {
+                Err(PutTerminalError::from_op_error(&err).into_client_error())
+            } else {
+                Err(ErrorKind::OperationError {
+                    cause: format!("PUT failed: {err}").into(),
+                }
+                .into())
+            };
             op_manager.send_client_result(client_tx, synthesized);
         }
     }
@@ -1658,11 +1666,8 @@ async fn run_relay_put<CB>(
     let originator_loopback = Some(upstream_addr) == own_addr;
     if originator_loopback {
         if let Err(err) = drive_result {
-            let cause = bound_cause(err.to_string());
-            let error_msg = NetMessage::from(PutMsg::Error {
-                id: incoming_tx,
-                cause: cause.clone(),
-            });
+            let cause = PutTerminalError::from_op_error(&err);
+            let error_msg = NetMessage::from(cause.clone().into_message(incoming_tx, true));
             let mut ctx = op_manager.op_ctx(incoming_tx);
             if let Err(send_err) = ctx.send_local_loopback(error_msg).await {
                 // Executor channel closed (node shutdown OR
@@ -1706,9 +1711,10 @@ async fn run_relay_put<CB>(
         // `completed()`, preserving the no-completed-in-loopback
         // invariant for any node along the chain that happens to be
         // the originator.
-        let cause = bound_cause(err.to_string());
+        let cause = PutTerminalError::from_op_error(&err);
         if let Err(send_err) =
-            relay_put_send_error(&op_manager, incoming_tx, cause.clone(), upstream_addr).await
+            relay_put_send_terminal_error(&op_manager, incoming_tx, cause.clone(), upstream_addr)
+                .await
         {
             tracing::warn!(
                 tx = %incoming_tx,
@@ -2616,6 +2622,15 @@ where
             )
             .await
         }
+        NetMessage::V1(NetMessageV1::Put(PutMsg::ValidationRejected { key, .. })) => {
+            relay_put_send_terminal_error(
+                op_manager,
+                incoming_tx,
+                PutTerminalError::validation_rejected(key),
+                upstream_addr,
+            )
+            .await
+        }
         NetMessage::V1(NetMessageV1::Put(PutMsg::Error {
             cause: downstream_cause,
             ..
@@ -3121,9 +3136,31 @@ async fn relay_put_send_error(
     cause: String,
     upstream_addr: SocketAddr,
 ) -> Result<(), OpError> {
+    relay_put_send_terminal_error(op_manager, incoming_tx, cause.into(), upstream_addr).await
+}
+
+// First release that can decode ValidationRejected. Keep the legacy Error
+// variant for old/unknown peers; never send an undecodable tag to them.
+const PUT_VALIDATION_REJECTED_MIN_VERSION: (u8, u8, u16) = (0, 2, 139);
+
+async fn relay_put_send_terminal_error(
+    op_manager: &OpManager,
+    incoming_tx: Transaction,
+    cause: PutTerminalError,
+    upstream_addr: SocketAddr,
+) -> Result<(), OpError> {
     let mut ctx = op_manager.op_ctx(incoming_tx);
-    let own_addr = op_manager.ring.connection_manager.get_own_addr();
-    relay_put_send_error_with_ctx(&mut ctx, own_addr, incoming_tx, cause, upstream_addr).await
+    let cm = &op_manager.ring.connection_manager;
+    let own_addr = cm.get_own_addr();
+    relay_put_send_terminal_error_with_ctx(
+        &mut ctx,
+        own_addr,
+        incoming_tx,
+        cause,
+        upstream_addr,
+        cm.remote_version(upstream_addr),
+    )
+    .await
 }
 
 /// Shutdown fallback for `run_relay_put`'s originator-loopback error
@@ -3157,12 +3194,9 @@ async fn relay_put_send_error(
 fn dispatch_loopback_shutdown_fallback(
     result_router_tx: &tokio::sync::mpsc::Sender<(Transaction, HostResult)>,
     incoming_tx: Transaction,
-    cause: String,
+    cause: PutTerminalError,
 ) {
-    let host_err: freenet_stdlib::client_api::ClientError = ErrorKind::OperationError {
-        cause: cause.into(),
-    }
-    .into();
+    let host_err = cause.into_client_error();
     if let Err(err) = result_router_tx.try_send((incoming_tx, Err(host_err))) {
         tracing::error!(
             tx = %incoming_tx,
@@ -3185,17 +3219,17 @@ fn dispatch_loopback_shutdown_fallback(
 /// behavioural tests in the parent module's `tests` module exercise
 /// the loopback/fire-and-forget branches and the wire envelope shape
 /// directly.
-async fn relay_put_send_error_with_ctx(
+async fn relay_put_send_terminal_error_with_ctx(
     ctx: &mut OpCtx,
     own_addr: Option<SocketAddr>,
     incoming_tx: Transaction,
-    cause: String,
+    cause: PutTerminalError,
     upstream_addr: SocketAddr,
+    remote_version: Option<(u8, u8, u16)>,
 ) -> Result<(), OpError> {
-    let msg = NetMessage::from(PutMsg::Error {
-        id: incoming_tx,
-        cause,
-    });
+    let typed_supported = Some(upstream_addr) == own_addr
+        || remote_version.is_some_and(|v| v >= PUT_VALIDATION_REJECTED_MIN_VERSION);
+    let msg = NetMessage::from(cause.into_message(incoming_tx, typed_supported));
     if Some(upstream_addr) == own_addr {
         ctx.send_local_loopback(msg)
             .await
@@ -3433,11 +3467,17 @@ async fn run_relay_put_streaming<CB>(
     // reach a later attempt's waiter, and with no waiter the upstream's dispatch
     // ignores it. Nothing is recorded against any peer here.
     if let Some(err) = failure_to_report_upstream(&drive_result) {
-        let cause = bound_cause(format!("streaming PUT relay failed: {err}"));
+        let cause = if matches!(err, OpError::ExecutorError(exec) if exec.validation_refusal_key().is_some())
+        {
+            PutTerminalError::from_op_error(err)
+        } else {
+            PutTerminalError::from_wire(format!("streaming PUT relay failed: {err}"))
+        };
         #[cfg(any(test, feature = "testing"))]
         RELAY_PUT_STREAMING_FAILURES_REPORTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Err(send_err) =
-            relay_put_send_error(&op_manager, incoming_tx, cause.clone(), upstream_addr).await
+            relay_put_send_terminal_error(&op_manager, incoming_tx, cause.clone(), upstream_addr)
+                .await
         {
             tracing::warn!(
                 tx = %incoming_tx,
@@ -4082,6 +4122,16 @@ where
                     reply_key,
                     upstream_addr,
                     downstream_hop_count,
+                )
+                .await
+                .map_err(RelayStreamingFailure::ReplyDispatch)
+            }
+            NetMessage::V1(NetMessageV1::Put(PutMsg::ValidationRejected { key, .. })) => {
+                relay_put_send_terminal_error(
+                    op_manager,
+                    incoming_tx,
+                    PutTerminalError::validation_rejected(key),
+                    upstream_addr,
                 )
                 .await
                 .map_err(RelayStreamingFailure::ReplyDispatch)
@@ -4839,6 +4889,126 @@ async fn drive_relay_probe_reconcile(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn relay_put_send_error_with_ctx(
+        ctx: &mut OpCtx,
+        own_addr: Option<SocketAddr>,
+        incoming_tx: Transaction,
+        cause: String,
+        upstream_addr: SocketAddr,
+    ) -> Result<(), OpError> {
+        relay_put_send_terminal_error_with_ctx(
+            ctx,
+            own_addr,
+            incoming_tx,
+            cause.into(),
+            upstream_addr,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn put_validation_refusal_crosses_hops_and_shutdown_delivery() {
+        use crate::node::{EventLoopNotificationsReceiver, event_loop_notification_channel};
+        use freenet_stdlib::client_api::{ContractError, RequestError};
+        let key = crate::operations::test_utils::make_contract_key(57);
+        let tx = dummy_tx();
+        let own: SocketAddr = "127.0.0.1:9011".parse().unwrap();
+        let remote: SocketAddr = "127.0.0.1:9012".parse().unwrap();
+        let mut cause = PutTerminalError::validation_rejected(key);
+        // Two remote relay hops, then the originator's loopback bypass.
+        for upstream in [remote, remote, own] {
+            let (receiver, sender) = event_loop_notification_channel();
+            let EventLoopNotificationsReceiver {
+                mut op_execution_receiver,
+                ..
+            } = receiver;
+            let mut ctx = OpCtx::new(tx, sender.op_execution_sender.clone());
+            relay_put_send_terminal_error_with_ctx(
+                &mut ctx,
+                Some(own),
+                tx,
+                cause,
+                upstream,
+                // Loopback has no negotiated remote version.
+                (upstream != own).then_some(PUT_VALIDATION_REJECTED_MIN_VERSION),
+            )
+            .await
+            .unwrap();
+            let (_, wire, target) = op_execution_receiver.recv().await.unwrap();
+            assert_eq!(target, if upstream == own { None } else { Some(remote) });
+            let wire: NetMessage =
+                bincode::deserialize(&bincode::serialize(&wire).unwrap()).unwrap();
+            cause = match classify_reply(&wire) {
+                ReplyClass::TerminalError { cause } => cause,
+                other => panic!("expected terminal refusal, got {other:?}"),
+            };
+        }
+        let (router_tx, mut router_rx) = tokio::sync::mpsc::channel(1);
+        dispatch_loopback_shutdown_fallback(&router_tx, tx, cause);
+        let (received_tx, result) = router_rx.recv().await.unwrap();
+        assert_eq!(received_tx, tx);
+        let err = result.unwrap_err();
+        assert!(matches!(err.kind(), ErrorKind::RequestError(
+            RequestError::ContractError(ContractError::Put { key: k, .. })
+        ) if *k == key));
+        assert!(router_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn put_validation_refusal_gates_unknown_and_old_peers() {
+        use crate::node::{EventLoopNotificationsReceiver, event_loop_notification_channel};
+        let key = crate::operations::test_utils::make_contract_key(57);
+        let tx = dummy_tx();
+        let own: SocketAddr = "127.0.0.1:9011".parse().unwrap();
+        let remote: SocketAddr = "127.0.0.1:9012".parse().unwrap();
+        for (version, typed) in [
+            (None, false),
+            (Some((0, 2, 138)), false),
+            (Some((0, 2, 139)), true),
+            (Some((0, 2, 140)), true),
+        ] {
+            let (receiver, sender) = event_loop_notification_channel();
+            let EventLoopNotificationsReceiver {
+                mut op_execution_receiver,
+                ..
+            } = receiver;
+            let mut ctx = OpCtx::new(tx, sender.op_execution_sender.clone());
+            relay_put_send_terminal_error_with_ctx(
+                &mut ctx,
+                Some(own),
+                tx,
+                PutTerminalError::validation_rejected(key),
+                remote,
+                version,
+            )
+            .await
+            .unwrap();
+            let (_, wire, _) = op_execution_receiver.recv().await.unwrap();
+            assert_eq!(
+                matches!(
+                    wire,
+                    NetMessage::V1(NetMessageV1::Put(PutMsg::ValidationRejected { .. }))
+                ),
+                typed
+            );
+        }
+    }
+
+    #[test]
+    fn put_validation_refusal_old_peer_fallback_is_not_retyped() {
+        let key = crate::operations::test_utils::make_contract_key(57);
+        let msg = PutTerminalError::validation_rejected(key).into_message(dummy_tx(), false);
+        assert!(matches!(msg, PutMsg::Error { .. }));
+        let ReplyClass::TerminalError { cause } = classify_reply(&NetMessage::from(msg)) else {
+            panic!("legacy error must still be terminal");
+        };
+        assert!(matches!(
+            cause.into_client_error().kind(),
+            ErrorKind::OperationError { .. }
+        ));
+    }
 
     fn dummy_key() -> ContractKey {
         ContractKey::from_id_and_code(ContractInstanceId::new([1u8; 32]), CodeHash::new([2u8; 32]))
@@ -5985,10 +6155,8 @@ mod tests {
              would hang the client until timeout"
         );
         assert!(
-            arm_body.contains("ErrorKind::OperationError"),
-            "Done(Err) arm MUST wrap the cause in \
-             freenet_stdlib::client_api::ErrorKind::OperationError so the \
-             client sees a structured error variant (not a generic string)"
+            arm_body.contains("cause.into_client_error()"),
+            "Done(Err) must preserve validation provenance at client delivery"
         );
         // The "does not advance" half of the invariant is covered
         // behaviourally by `drive_retry_loop_done_err_does_not_call_advance`.
@@ -6393,7 +6561,7 @@ mod tests {
                 .find("publish_locally_stored_put(")
                 .unwrap_or_else(|| panic!("{arm_head} must be able to publish the local success"));
             let error_pos = arm
-                .find("ErrorKind::OperationError")
+                .find("DriverOutcome::Publish(Err(")
                 .unwrap_or_else(|| panic!("{arm_head} must still publish the real failure"));
             assert!(
                 decision_pos < success_pos,
@@ -6689,7 +6857,7 @@ mod tests {
              error-publication path"
         );
         assert!(
-            body.contains("PutMsg::Error {"),
+            body.contains("cause.clone().into_message(incoming_tx, true)"),
             "run_relay_put must construct a PutMsg::Error envelope to \
              deliver the loopback failure to the originator's driver"
         );
@@ -7435,7 +7603,8 @@ mod tests {
             "after the downstream-reply step the only failure left is the reply's dispatch"
         );
         let reply_calls = after.matches("relay_put_send_response(").count()
-            + after.matches("relay_put_finalize_local(").count();
+            + after.matches("relay_put_finalize_local(").count()
+            + after.matches("relay_put_send_terminal_error(").count();
         assert!(reply_calls > 0, "the downstream-reply step sends the reply");
         assert_eq!(
             after
@@ -7919,12 +8088,12 @@ mod tests {
         let branch_body = &body[else_start..];
 
         assert!(
-            branch_body.contains("bound_cause(err.to_string())"),
-            "non-loopback Err branch MUST apply bound_cause(err.to_string()) \
+            branch_body.contains("PutTerminalError::from_op_error(&err)"),
+            "non-loopback Err branch MUST classify and bound the executor error \
              before bubbling — keeps the per-hop DoS amplification bound"
         );
         assert!(
-            branch_body.contains("relay_put_send_error("),
+            branch_body.contains("relay_put_send_terminal_error("),
             "non-loopback Err branch MUST call relay_put_send_error to \
              emit PutMsg::Error to upstream_addr"
         );
@@ -7958,7 +8127,7 @@ mod tests {
         let tx = dummy_tx();
         let cause = "contract rejection: version not increasing".to_string();
 
-        dispatch_loopback_shutdown_fallback(&router_tx, tx, cause.clone());
+        dispatch_loopback_shutdown_fallback(&router_tx, tx, cause.clone().into());
 
         let (received_tx, host_result) = router_rx
             .recv()
@@ -8011,7 +8180,7 @@ mod tests {
         dispatch_loopback_shutdown_fallback(
             &router_tx,
             tx,
-            "shutdown-time deterministic failure".into(),
+            "shutdown-time deterministic failure".to_string().into(),
         );
 
         // Result router got the entry. Discard the result — this
@@ -8055,7 +8224,7 @@ mod tests {
 
         let tx = dummy_tx();
         // No panic, no unwind. The helper logs the failure and returns.
-        dispatch_loopback_shutdown_fallback(&router_tx, tx, "x".into());
+        dispatch_loopback_shutdown_fallback(&router_tx, tx, "x".to_string().into());
     }
 
     /// Full `result_router_tx` MUST also be handled gracefully —
@@ -8084,7 +8253,7 @@ mod tests {
         // helper uses `try_send` internally, so this returns
         // immediately even with the channel full.
         let result = tokio::time::timeout(std::time::Duration::from_millis(100), async {
-            dispatch_loopback_shutdown_fallback(&router_tx, tx, "shutdown".into());
+            dispatch_loopback_shutdown_fallback(&router_tx, tx, "shutdown".to_string().into());
         })
         .await;
         assert!(

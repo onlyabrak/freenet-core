@@ -61,12 +61,13 @@ pub(crate) fn bound_cause(cause: String) -> String {
 }
 
 /// In-process counterpart of the wire [`PutMsg::Error::cause`].
-/// The wire side stays as a raw `String` for bincode compat;
-/// `PutTerminalError` gives the retry-loop `Terminal` type a named
-/// shape and a single point to enforce length caps.
+/// Generic errors keep their raw String wire layout for bincode compatibility.
+/// Explicit validation refusals use the appended ValidationRejected variant.
+/// The retry loop preserves that provenance independently of the cause text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PutTerminalError {
     cause: String,
+    validation_key: Option<ContractKey>,
 }
 
 impl PutTerminalError {
@@ -75,6 +76,7 @@ impl PutTerminalError {
     pub(crate) fn from_wire(cause: String) -> Self {
         Self {
             cause: bound_cause(cause),
+            validation_key: None,
         }
     }
 
@@ -82,8 +84,52 @@ impl PutTerminalError {
         &self.cause
     }
 
-    pub(crate) fn into_string(self) -> String {
-        self.cause
+    pub(crate) fn validation_rejected(key: ContractKey) -> Self {
+        Self {
+            cause: freenet_stdlib::client_api::ContractError::invalid_put(key).to_string(),
+            validation_key: Some(key),
+        }
+    }
+
+    pub(crate) fn from_op_error(err: &OpError) -> Self {
+        if let OpError::ExecutorError(exec) = err {
+            if let Some(key) = exec.validation_refusal_key() {
+                return Self::validation_rejected(key);
+            }
+        }
+        Self::from_wire(err.to_string())
+    }
+
+    pub(crate) fn into_client_error(self) -> freenet_stdlib::client_api::ClientError {
+        use freenet_stdlib::client_api::{ContractError, ErrorKind, RequestError};
+        match self.validation_key {
+            Some(key) => ErrorKind::RequestError(RequestError::ContractError(
+                ContractError::invalid_put(key),
+            ))
+            .into(),
+            None => ErrorKind::OperationError {
+                cause: self.cause.into(),
+            }
+            .into(),
+        }
+    }
+
+    /// Append-only wire extension. Older peers still receive the original Error
+    /// layout; a route through them cannot preserve the validation discriminator.
+    pub(crate) fn into_message(self, id: Transaction, typed_supported: bool) -> PutMsg {
+        match self.validation_key {
+            Some(key) if typed_supported => PutMsg::ValidationRejected { id, key },
+            _ => PutMsg::Error {
+                id,
+                cause: self.cause,
+            },
+        }
+    }
+}
+
+impl From<String> for PutTerminalError {
+    fn from(cause: String) -> Self {
+        Self::from_wire(cause)
     }
 }
 
@@ -603,6 +649,10 @@ mod messages {
             /// Addresses to skip when selecting next hop (loop prevention).
             skip_list: HashSet<std::net::SocketAddr>,
         },
+        /// An explicit validate_state refusal, carrying no untrusted cause text.
+        /// Added after all existing variants so their bincode tags stay stable.
+        /// Send only to peers supporting the #5746 wire extension.
+        ValidationRejected { id: Transaction, key: ContractKey },
     }
 
     impl InnerMessage for PutMsg {
@@ -614,6 +664,7 @@ mod messages {
                 | Self::ResponseStreaming { id, .. }
                 | Self::ForwardingAck { id, .. }
                 | Self::Error { id, .. }
+                | Self::ValidationRejected { id, .. }
                 | Self::ProbeRequest { id, .. }
                 | Self::ProbeResponse { id, .. }
                 | Self::ProbeReconcile { id, .. } => id,
@@ -633,6 +684,7 @@ mod messages {
                 // already knows the key it requested; the failure is keyed
                 // by tx only.
                 Self::Error { .. } => None,
+                Self::ValidationRejected { key, .. } => Some(Location::from(key.id())),
                 Self::ProbeRequest { contract_key, .. } => Some(Location::from(contract_key.id())),
                 Self::ProbeResponse { key, .. } => Some(Location::from(key.id())),
                 Self::ProbeReconcile { key, .. } => Some(Location::from(key.id())),
@@ -685,6 +737,9 @@ mod messages {
                 }
                 Self::ForwardingAck { id, contract_key } => {
                     write!(f, "PutForwardingAck(id: {}, key: {})", id, contract_key)
+                }
+                Self::ValidationRejected { id, key } => {
+                    write!(f, "PutValidationRejected(id: {}, key: {})", id, key)
                 }
                 Self::Error { id, cause } => {
                     write!(f, "PutError(id: {}, cause: {})", id, cause)
@@ -751,6 +806,20 @@ mod tests {
     use super::*;
     use crate::message::{InnerMessage, Transaction};
     use crate::operations::test_utils::make_contract_key;
+
+    #[test]
+    fn put_validation_refusal_wire_tag_is_appended() {
+        let tx = Transaction::new::<PutMsg>();
+        let key = make_contract_key(57);
+        let msg = PutMsg::ValidationRejected { id: tx, key };
+        let bytes = bincode::serialize(&msg).unwrap();
+        assert_eq!(&bytes[..4], &9u32.to_le_bytes());
+        let decoded: PutMsg = bincode::deserialize(&bytes).unwrap();
+        assert!(
+            matches!(decoded, PutMsg::ValidationRejected { id, key: k } if id == tx && k == key)
+        );
+        assert_eq!(msg.id(), &tx);
+    }
 
     #[test]
     fn put_msg_id_returns_transaction() {
