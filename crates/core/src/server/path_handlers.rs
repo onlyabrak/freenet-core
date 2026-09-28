@@ -6763,6 +6763,15 @@ mod tests {
             html.contains("freenetBridge"),
             "bridge script not found in shell page"
         );
+        // Passkey bridge (#5764): the shell answers `passkey` and binds the PRF
+        // input to the contract. A fast local signal only — whether the
+        // sandboxed frame really reaches it, and whether the bound secret
+        // differs from the raw-salt one, is the Playwright suite's
+        // (shell.spec.ts) and shell_bridge_passkey.test.mjs's.
+        assert!(
+            html.contains("msg.type === 'passkey'") && html.contains("freenet shell passkey"),
+            "passkey bridge (and its per-contract binding) not found in shell page"
+        );
         // Auth token must NOT be exposed as window.__FREENET_AUTH_TOKEN__
         assert!(
             !html.contains("__FREENET_AUTH_TOKEN__"),

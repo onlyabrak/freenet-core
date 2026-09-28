@@ -674,6 +674,235 @@ function freenetBridge(authToken, userToken, hostedMode) {
   }
   // notify-offer:END
 
+  // --- Passkeys (WebAuthn + PRF) for the app (#5764) ----------------------
+  // The app runs in the sandboxed (opaque-origin) iframe, which has no
+  // publickey-credentials-* grant and no effective domain to be a relying
+  // party: WebAuthn is unusable there. The shell has a real origin and can.
+  // So the app asks the shell (`{type:'passkey', op:'create'|'get', salt}`),
+  // the shell asks the PERSON in its own host-owned bar, and only a REAL click
+  // there runs WebAuthn — a postMessage carries no transient activation, which
+  // WebAuthn requires in the calling document (Safari enforces it for get too),
+  // and the bar is the consent step, naming the contract that asks.
+  //
+  // Binding: every contract on this gateway shares the relying-party id (the
+  // shell's host), so the same passkey answers any of them. The shell never
+  // evaluates PRF at the app's salt: it evaluates it at
+  //   SHA-256("freenet shell passkey\0" + <contract key> + "\0" + salt)
+  // with the contract key taken from the server-routed path — NEVER from the
+  // message (the same rule as contractConsentKey) — so one contract cannot
+  // obtain another's secret by sending its salt. Only the PRF output and the
+  // credential id go back; never an assertion usable elsewhere.
+  // passkey:BEGIN (extracted verbatim by shell_bridge_passkey.test.mjs)
+  var passkeyPending = false;
+  var lastPasskeyAt = 0;
+  var PASSKEY_LABEL = 'freenet shell passkey';
+
+  function passkeyContract() {
+    var m = location.pathname.match(/\/v[12]\/contract\/web\/([^/?#]+)/);
+    return m ? m[1] : null;
+  }
+
+  // Exactly 32 bytes (an ArrayBuffer or a typed array), copied; else null.
+  function passkeyBytes32(x) {
+    var b = null;
+    if (x instanceof ArrayBuffer) b = new Uint8Array(x);
+    else if (ArrayBuffer.isView(x))
+      b = new Uint8Array(x.buffer, x.byteOffset, x.byteLength);
+    if (!b || b.byteLength !== 32) return null;
+    return new Uint8Array(b);
+  }
+
+  // A credential id: 1..1023 bytes, copied; else null.
+  function passkeyCredentialId(x) {
+    var b = null;
+    if (x instanceof ArrayBuffer) b = new Uint8Array(x);
+    else if (ArrayBuffer.isView(x))
+      b = new Uint8Array(x.buffer, x.byteOffset, x.byteLength);
+    if (!b || b.byteLength < 1 || b.byteLength > 1023) return null;
+    return new Uint8Array(b);
+  }
+
+  // The PRF input the shell evaluates for this contract and the app's salt.
+  function passkeyBoundSalt(contract, salt) {
+    var head = new TextEncoder().encode(PASSKEY_LABEL + '\0' + contract + '\0');
+    var all = new Uint8Array(head.byteLength + salt.byteLength);
+    all.set(head, 0);
+    all.set(salt, head.byteLength);
+    return crypto.subtle.digest('SHA-256', all);
+  }
+
+  // A host that can be a relying party: a name, not an IP literal.
+  function passkeyRpId() {
+    var h = location.hostname;
+    if (
+      !h ||
+      /^[0-9.]+$/.test(h) ||
+      h.indexOf(':') !== -1 ||
+      h.charAt(0) === '['
+    )
+      return null;
+    return h;
+  }
+
+  function passkeyReply(id, fields) {
+    var msg = { __freenet_shell__: true, type: 'passkey_result', id: id };
+    for (var k in fields) msg[k] = fields[k];
+    sendToIframe(msg);
+  }
+
+  function passkeyRequest(msg) {
+    var id = typeof msg.id === 'string' ? msg.id.slice(0, 64) : '';
+    var op = msg.op;
+    var salt = passkeyBytes32(msg.salt);
+    if ((op !== 'create' && op !== 'get') || !salt) {
+      passkeyReply(id, { ok: false, error: 'bad_request' });
+      return;
+    }
+    var contract = passkeyContract();
+    var rpId = passkeyRpId();
+    if (
+      !contract ||
+      !rpId ||
+      typeof PublicKeyCredential === 'undefined' ||
+      !navigator.credentials ||
+      !window.crypto ||
+      !crypto.subtle
+    ) {
+      passkeyReply(id, { ok: false, error: 'unsupported' });
+      return;
+    }
+    var credential =
+      msg.credential == null ? null : passkeyCredentialId(msg.credential);
+    if (msg.credential != null && !credential) {
+      passkeyReply(id, { ok: false, error: 'bad_request' });
+      return;
+    }
+    // One prompt at a time, and not faster than one a second: a contract
+    // cannot stack bars or flood the person with prompts.
+    var now = Date.now();
+    if (passkeyPending || now - lastPasskeyAt < 1000) {
+      passkeyReply(id, { ok: false, error: 'busy' });
+      return;
+    }
+    passkeyPending = true;
+    lastPasskeyAt = now;
+
+    var bar = document.createElement('div');
+    bar.setAttribute('role', 'dialog');
+    bar.setAttribute('aria-label', 'Passkey');
+    bar.style.cssText =
+      'position:fixed;left:50%;bottom:16px;transform:translateX(-50%);' +
+      'z-index:2147483647;display:flex;align-items:center;gap:12px;' +
+      'max-width:calc(100% - 32px);padding:10px 14px;border-radius:10px;' +
+      'background:#1b1f24;color:#fff;font:14px/1.3 system-ui,sans-serif;' +
+      'box-shadow:0 4px 20px rgba(0,0,0,0.35);';
+    var label = document.createElement('span');
+    label.textContent =
+      (op === 'create'
+        ? 'Create a passkey for this app'
+        : 'Sign in to this app with your passkey') +
+      ' (contract ' +
+      contract.slice(0, 8) +
+      '…)';
+    label.style.cssText = 'flex:1;';
+    var go = document.createElement('button');
+    go.textContent = 'Continue';
+    go.style.cssText =
+      'cursor:pointer;border:none;border-radius:6px;padding:6px 12px;' +
+      'background:#007FFF;color:#fff;font:inherit;font-weight:600;';
+    var cancel = document.createElement('button');
+    cancel.textContent = 'Cancel';
+    cancel.style.cssText =
+      'cursor:pointer;border:none;border-radius:6px;padding:6px 10px;' +
+      'background:transparent;color:#9aa4b2;font:inherit;';
+
+    var answered = false;
+    function finish(fields) {
+      if (answered) return;
+      answered = true;
+      passkeyPending = false;
+      try {
+        document.body.removeChild(bar);
+      } catch (e) {}
+      passkeyReply(id, fields);
+    }
+    cancel.addEventListener('click', function () {
+      finish({ ok: false, error: 'dismissed' });
+    });
+    go.addEventListener('click', function () {
+      go.disabled = true;
+      // The binding is computed BEFORE WebAuthn is called, synchronously in
+      // this click's task where possible: digest() is async, so WebAuthn runs
+      // from its continuation — transient activation lasts long enough for
+      // that in every engine (it is time-based, not task-bound).
+      passkeyBoundSalt(contract, salt)
+        .then(function (bound) {
+          var challenge = crypto.getRandomValues(new Uint8Array(32));
+          var ext = { prf: { eval: { first: new Uint8Array(bound) } } };
+          if (op === 'create') {
+            var name =
+              typeof msg.name === 'string' && msg.name
+                ? msg.name.slice(0, 64)
+                : 'Freenet app';
+            return navigator.credentials.create({
+              publicKey: {
+                rp: { name: 'Freenet', id: rpId },
+                user: {
+                  id: crypto.getRandomValues(new Uint8Array(16)),
+                  name: name,
+                  displayName: name,
+                },
+                challenge: challenge,
+                pubKeyCredParams: [
+                  { type: 'public-key', alg: -7 },
+                  { type: 'public-key', alg: -257 },
+                ],
+                authenticatorSelection: {
+                  residentKey: 'required',
+                  userVerification: 'required',
+                },
+                extensions: ext,
+              },
+            });
+          }
+          var req = {
+            challenge: challenge,
+            rpId: rpId,
+            userVerification: 'required',
+            extensions: ext,
+          };
+          if (credential)
+            req.allowCredentials = [{ type: 'public-key', id: credential }];
+          return navigator.credentials.get({ publicKey: req });
+        })
+        .then(function (cred) {
+          var res =
+            (cred &&
+              cred.getClientExtensionResults &&
+              cred.getClientExtensionResults()) ||
+            {};
+          var prf = res.prf || {};
+          var first = prf.results && prf.results.first;
+          finish({
+            ok: true,
+            credential: cred.rawId,
+            // A create may enable PRF without evaluating it (then `prf` is
+            // null and the app asks again with op:'get').
+            prf: first ? passkeyBytes32(first) : null,
+            prfEnabled: prf.enabled === true || !!first,
+          });
+        })
+        .catch(function (e) {
+          finish({ ok: false, error: (e && e.name) || 'failed' });
+        });
+    });
+    bar.appendChild(label);
+    bar.appendChild(go);
+    bar.appendChild(cancel);
+    document.body.appendChild(bar);
+  }
+  // passkey:END
+
   // --- Service-worker fallback for notifications (mobile) ----------------
   // Desktop browsers show notifications with the page-level `new
   // Notification(...)` constructor (used unchanged in showAppNotification).
@@ -1026,6 +1255,8 @@ function freenetBridge(authToken, userToken, hostedMode) {
             history.replaceState(history.state, '', h);
           }
         }
+      } else if (msg.type === 'passkey') {
+        passkeyRequest(msg);
       } else if (msg.type === 'clipboard' && typeof msg.text === 'string') {
         // Sandboxed iframes can't use navigator.clipboard due to permissions
         // policy. Proxy clipboard writes through the trusted shell instead.

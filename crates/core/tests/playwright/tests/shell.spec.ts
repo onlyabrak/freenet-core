@@ -881,3 +881,113 @@ test("navigating to a page with no <title> at all leaves the tab on the previous
   // above), but the tab title must be UNCHANGED from before the hop.
   await expect(page).toHaveTitle("Freenet shell smoke-test fixture");
 });
+
+// Passkeys (#5764). The sandboxed contract frame has no WebAuthn (no
+// publickey-credentials-* grant, and an opaque origin is no relying party), so
+// the shell performs it for the app: the app posts `{type:'passkey'}`, the shell
+// asks in its OWN bar, and only a real click there runs WebAuthn. An IP host is
+// not a relying-party id, so these load the shell at `localhost` (the harness
+// serves it at 127.0.0.1, where the bridge answers `unsupported` by design).
+const localShell = () => shellUrl!.replace("//127.0.0.1:", "//localhost:");
+
+// Ask the bridge from inside the real sandboxed frame; resolves with the reply.
+function askPasskey(appFrame: import("@playwright/test").Frame, req: Record<string, unknown>) {
+  return appFrame.evaluate(
+    (req) =>
+      new Promise<Record<string, unknown>>((resolve) => {
+        const id = `pk-${Math.random()}`;
+        const bytes = (b: unknown) => (b ? Array.from(new Uint8Array(b as ArrayBuffer)) : null);
+        addEventListener("message", function onReply(e) {
+          const d = e.data;
+          if (!d || d.type !== "passkey_result" || d.id !== id) return;
+          removeEventListener("message", onReply);
+          resolve({ ...d, prf: bytes(d.prf), credential: bytes(d.credential) });
+        });
+        const credential = req.credential ? new Uint8Array(req.credential as number[]) : undefined;
+        parent.postMessage(
+          { __freenet_shell__: true, type: "passkey", ...req, id, credential, salt: new Uint8Array(32).fill(0x5a) },
+          "*",
+        );
+      }),
+    req,
+  );
+}
+
+async function sandboxedFrame(page: Page) {
+  await page.goto(localShell());
+  await fixtureFrame(page);
+  const appFrame = page.frames().find((f) => f.url().includes("__sandbox=1"));
+  expect(appFrame, "sandboxed contract frame not found").toBeTruthy();
+  return appFrame!;
+}
+
+test("the sandboxed app reaches the passkey bridge; the shell asks in its own bar (#5764)", async ({ page }) => {
+  const appFrame = await sandboxedFrame(page);
+  // The reason the bridge exists: WebAuthn itself is unavailable in the frame.
+  const direct = await appFrame.evaluate(async () => {
+    try {
+      await navigator.credentials.create({ publicKey: { rp: { name: "x" }, user: { id: new Uint8Array(8), name: "x", displayName: "x" }, challenge: new Uint8Array(32), pubKeyCredParams: [{ type: "public-key", alg: -7 }] } });
+      return "created";
+    } catch (e) {
+      return (e as Error).name;
+    }
+  });
+  expect(direct, "WebAuthn should be unavailable inside the sandboxed frame").not.toBe("created");
+
+  // The app asks; the SHELL draws the bar (outside the frame), naming the
+  // contract. Red if the bridge is removed: no bar ever appears.
+  const reply = askPasskey(appFrame, { op: "get" });
+  const bar = page.getByRole("dialog", { name: "Passkey" });
+  await expect(bar).toBeVisible();
+  await expect(bar).toContainText("Sign in to this app with your passkey");
+  await expect(bar).toContainText("contract ");
+  await bar.getByRole("button", { name: "Cancel" }).click();
+  expect((await reply).error).toBe("dismissed");
+  await expect(bar).toHaveCount(0);
+});
+
+test("the passkey bridge returns a contract-bound PRF secret (#5764)", async ({ page, browserName }) => {
+  // A virtual authenticator is a Chromium DevTools feature; the bridge's
+  // reachability and bar are covered in every engine by the test above.
+  test.skip(browserName !== "chromium", "virtual WebAuthn authenticator is Chromium-only (CDP)");
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send("WebAuthn.enable");
+  await cdp.send("WebAuthn.addVirtualAuthenticator", {
+    options: { protocol: "ctap2", transport: "internal", hasResidentKey: true, hasUserVerification: true, isUserVerified: true, hasPrf: true },
+  });
+  const appFrame = await sandboxedFrame(page);
+  const bar = page.getByRole("dialog", { name: "Passkey" });
+
+  const created = askPasskey(appFrame, { op: "create", name: "tester" });
+  await bar.getByRole("button", { name: "Continue" }).click();
+  const c = await created;
+  expect(c.ok, JSON.stringify(c)).toBe(true);
+  expect((c.credential as number[]).length).toBeGreaterThan(0);
+
+  const got = async () => {
+    const r = askPasskey(appFrame, { op: "get", credential: c.credential });
+    await page.waitForTimeout(1100); // the bridge allows one prompt a second
+    await bar.getByRole("button", { name: "Continue" }).click();
+    return r;
+  };
+  await page.waitForTimeout(1100);
+  const g1 = await got();
+  const g2 = await got();
+  expect(g1.ok, JSON.stringify(g1)).toBe(true);
+  expect((g1.prf as number[]).length).toBe(32);
+  expect(g2.prf, "the same passkey gives the same secret").toEqual(g1.prf);
+
+  // The binding: the shell never evaluates PRF at the app's raw salt. The same
+  // credential evaluated at the raw salt directly (in the shell document, which
+  // CAN use WebAuthn) must give a DIFFERENT secret — equal would mean any
+  // contract could obtain another's secret by sending its salt.
+  const raw = await page.evaluate(async (id) => {
+    const r = await navigator.credentials.get({
+      publicKey: { challenge: new Uint8Array(32), rpId: location.hostname, userVerification: "required", allowCredentials: [{ type: "public-key", id: new Uint8Array(id) }], extensions: { prf: { eval: { first: new Uint8Array(32).fill(0x5a) } } } as AuthenticationExtensionsClientInputs },
+    });
+    const first = (r as PublicKeyCredential).getClientExtensionResults().prf?.results?.first;
+    return first ? Array.from(new Uint8Array(first as ArrayBuffer)) : null;
+  }, c.credential as number[]);
+  expect(raw?.length).toBe(32);
+  expect(raw, "the bridge's secret must not be the raw-salt secret").not.toEqual(g1.prf);
+});
